@@ -93,6 +93,38 @@ fn clean_content(content: &str, msg_type: i32) -> String {
                     }
                     parts.join("\n")
                 }
+                // Merged-forward / chat history (19): surface the nested messages,
+                // not just the title. recorditem holds an XML-escaped list of dataitems.
+                19 => {
+                    let mut parts = vec![format!("[Chat History] {title}")];
+                    if let Some(record_raw) = extract_xml_tag(content, "recorditem") {
+                        let record = record_raw
+                            .replace("&lt;", "<")
+                            .replace("&gt;", ">")
+                            .replace("&amp;", "&")
+                            .replace("&quot;", "\"");
+                        let mut from = 0;
+                        while let Some(rel) = record[from..].find("<dataitem") {
+                            let s = from + rel;
+                            let Some(eo) = record[s..].find("</dataitem>") else { break };
+                            let item = &record[s..s + eo + "</dataitem>".len()];
+                            from = s + eo + "</dataitem>".len();
+                            let sender = extract_xml_tag(item, "sourcename")
+                                .or_else(|| extract_xml_tag(item, "displayname"))
+                                .unwrap_or_default();
+                            let body = extract_xml_tag(item, "datatitle")
+                                .or_else(|| extract_xml_tag(item, "datadesc"))
+                                .unwrap_or_else(|| "[media]".to_string());
+                            parts.push(if sender.is_empty() {
+                                body
+                            } else {
+                                format!("{sender}: {body}")
+                            });
+                        }
+                    }
+                    // No items parsed → fall back to the title alone.
+                    if parts.len() == 1 { title } else { parts.join("\n") }
+                }
                 _ => {
                     if title.is_empty() {
                         content.to_string()
@@ -139,7 +171,6 @@ fn extract_reply_info(content: &str, msg_type: i32) -> Option<ReplyInfo> {
     })
 }
 
-/// Extract an XML attribute value: attr="value"
 /// Extract an XML attribute value: `attr="value"`.
 ///
 /// Tolerates optional whitespace around `=` and either quote style. Some WeChat
@@ -474,5 +505,24 @@ mod tests {
     #[test]
     fn extract_tag_still_works() {
         assert_eq!(extract_xml_tag("<title>hi</title>", "title").as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn chat_history_extracts_nested_messages() {
+        let xml = r#"<msg><appmsg><title>Chat History of Group</title><type>19</type>
+            <recorditem>&lt;recordinfo&gt;
+              &lt;dataitem datatype="1"&gt;&lt;sourcename&gt;Alice&lt;/sourcename&gt;&lt;datatitle&gt;hey&lt;/datatitle&gt;&lt;/dataitem&gt;
+              &lt;dataitem datatype="2"&gt;&lt;sourcename&gt;Bob&lt;/sourcename&gt;&lt;datadesc&gt;a photo&lt;/datadesc&gt;&lt;/dataitem&gt;
+            &lt;/recordinfo&gt;</recorditem></appmsg></msg>"#;
+        let out = clean_content(xml, 49);
+        assert!(out.starts_with("[Chat History] Chat History of Group"), "got: {out}");
+        assert!(out.contains("Alice: hey"), "got: {out}");
+        assert!(out.contains("Bob: a photo"), "got: {out}");
+    }
+
+    #[test]
+    fn chat_history_without_items_falls_back_to_title() {
+        let xml = r#"<msg><appmsg><title>Chat History</title><type>19</type></appmsg></msg>"#;
+        assert_eq!(clean_content(xml, 49), "Chat History");
     }
 }
