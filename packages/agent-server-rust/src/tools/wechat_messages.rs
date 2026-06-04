@@ -140,12 +140,36 @@ fn extract_reply_info(content: &str, msg_type: i32) -> Option<ReplyInfo> {
 }
 
 /// Extract an XML attribute value: attr="value"
+/// Extract an XML attribute value: `attr="value"`.
+///
+/// Tolerates optional whitespace around `=` and either quote style. Some WeChat
+/// clients emit spaced attributes (e.g. `cdnurl = "http://..."`); the previous
+/// literal `attr="` match missed those, surfacing stickers/links as bare
+/// placeholders (`[emoji]`) even though the CDN URL was present. Requires a word
+/// boundary before `attr` so e.g. `md5` does not match inside `androidmd5`.
 fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
-    let pattern = format!("{attr}=\"");
-    let start = xml.find(&pattern)? + pattern.len();
-    let end = xml[start..].find('"')? + start;
-    let val = xml[start..end].trim().to_string();
-    if val.is_empty() { None } else { Some(val) }
+    let b = xml.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = xml[from..].find(attr) {
+        let i = from + rel;
+        from = i + attr.len();
+        // word boundary: char before `attr` must not extend a longer attribute name
+        if i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_') {
+            continue;
+        }
+        let mut j = from;
+        while j < b.len() && b[j].is_ascii_whitespace() { j += 1; }
+        if j >= b.len() || b[j] != b'=' { continue; }
+        j += 1;
+        while j < b.len() && b[j].is_ascii_whitespace() { j += 1; }
+        if j >= b.len() || (b[j] != b'"' && b[j] != b'\'') { continue; }
+        let quote = b[j] as char;
+        j += 1;
+        let end = xml[j..].find(quote)? + j;
+        let val = xml[j..end].trim().to_string();
+        return if val.is_empty() { None } else { Some(val) };
+    }
+    None
 }
 
 /// Extract text between XML tags: <tag>text</tag>
@@ -398,4 +422,57 @@ pub fn list_messages(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clean_content, extract_xml_attr, extract_xml_tag};
+
+    #[test]
+    fn attr_no_spaces() {
+        let xml = r#"<emoji cdnurl="http://a/x" md5="abc"/>"#;
+        assert_eq!(extract_xml_attr(xml, "cdnurl").as_deref(), Some("http://a/x"));
+    }
+
+    #[test]
+    fn attr_spaced_equals() {
+        // Some clients emit `cdnurl = "..."` — previously missed -> rendered "[emoji]".
+        let xml = r#"<emoji cdnurl = "http://a/x" />"#;
+        assert_eq!(extract_xml_attr(xml, "cdnurl").as_deref(), Some("http://a/x"));
+    }
+
+    #[test]
+    fn attr_single_quotes() {
+        assert_eq!(extract_xml_attr(r#"<emoji cdnurl='http://a/x'/>"#, "cdnurl").as_deref(),
+                   Some("http://a/x"));
+    }
+
+    #[test]
+    fn attr_word_boundary() {
+        // `md5` must not match inside `androidmd5`.
+        let xml = r#"<emoji androidmd5="WRONG" md5="RIGHT"/>"#;
+        assert_eq!(extract_xml_attr(xml, "md5").as_deref(), Some("RIGHT"));
+    }
+
+    #[test]
+    fn attr_missing_is_none() {
+        assert_eq!(extract_xml_attr(r#"<emoji md5="abc"/>"#, "cdnurl"), None);
+    }
+
+    #[test]
+    fn emoji_content_with_spaced_cdnurl() {
+        // The real bug: spaced attributes from some clients rendered "[emoji]".
+        let xml = r#"<msg><emoji type = "1" md5 = "abc" cdnurl = "http://snsvideo.c2c.wechat.com/x" /></msg>"#;
+        assert_eq!(clean_content(xml, 47), "http://snsvideo.c2c.wechat.com/x");
+    }
+
+    #[test]
+    fn emoji_content_without_url_is_placeholder() {
+        assert_eq!(clean_content(r#"<msg><emoji md5="abc"/></msg>"#, 47), "[emoji]");
+    }
+
+    #[test]
+    fn extract_tag_still_works() {
+        assert_eq!(extract_xml_tag("<title>hi</title>", "title").as_deref(), Some("hi"));
+    }
 }
