@@ -3,12 +3,14 @@
 Convert WeChat proprietary media formats to standard formats.
 
 Modes:
-  wxgf2img  — WXGF (HEVC in custom container) → JPEG or GIF
-  silk2mp3  — SILK_V3 voice audio → MP3
+  wxgf2img    — WXGF (HEVC in custom container) → JPEG or GIF
+  silk2mp3    — SILK_V3 voice audio → MP3
+  videosample — MP4 video → one JPEG contact-sheet of N uniformly-sampled frames (N keyed off duration)
 
 Usage:
-  media-convert wxgf2img < input.wxgf > output.jpg
-  media-convert silk2mp3 < input.silk > output.mp3
+  media-convert wxgf2img    < input.wxgf  > output.jpg
+  media-convert silk2mp3    < input.silk  > output.mp3
+  media-convert videosample < input.mp4   > frames.jpg
 
 Reads binary from stdin, writes converted binary to stdout.
 Format hint printed to stderr as "FORMAT:<ext>".
@@ -203,12 +205,67 @@ def silk2mp3(data):
 
 
 # ============================================
+# MP4 → contact-sheet of sampled frames
+# ============================================
+
+# Budget: ~1 sampled frame per N seconds of video, clamped to a 3x3 sheet.
+SAMPLE_SECONDS_PER_FRAME = 4.0
+SAMPLE_MAX_FRAMES = 9
+
+
+def _probe_duration(path):
+    """Video duration in seconds via ffprobe, or 0.0 if unknown."""
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=nokey=1:noprint_wrappers=1", path],
+        capture_output=True, text=True,
+    )
+    try:
+        return float((proc.stdout or "").strip())
+    except ValueError:
+        return 0.0
+
+
+def videosample(data):
+    """Sample N uniformly-spaced frames from an MP4 (N keyed off duration) and pack them into one JPEG
+    contact-sheet. A short/duration-unknown clip yields a single poster frame. Returns (jpeg_bytes, "jpeg").
+    The bot can't decode raw MP4, so a frame grid is how the model sees the video's content/motion."""
+    import math
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+        f.write(data)
+        src = f.name
+    try:
+        dur = _probe_duration(src)
+        n = max(1, min(SAMPLE_MAX_FRAMES, round(dur / SAMPLE_SECONDS_PER_FRAME))) if dur > 0 else 1
+        if n <= 1:
+            # single poster frame
+            vf = "scale=480:-2"
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", src,
+                   "-frames:v", "1", "-vf", vf, "-c:v", "mjpeg", "-q:v", "4", "-f", "image2", "-"]
+        else:
+            cols = math.ceil(math.sqrt(n))
+            rows = math.ceil(n / cols)
+            # `fps=n/dur` spreads ~n frames across the whole clip; `tile` packs them into one image.
+            vf = f"fps={n}/{dur:.3f},scale=320:-2,tile={cols}x{rows}"
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", src,
+                   "-vf", vf, "-frames:v", "1", "-update", "1",
+                   "-c:v", "mjpeg", "-q:v", "4", "-f", "image2", "-"]
+        proc = subprocess.run(cmd, capture_output=True)
+        if proc.returncode != 0 or not proc.stdout:
+            raise RuntimeError(f"ffmpeg videosample failed: {proc.stderr.decode()[:200]}")
+        return proc.stdout, "jpeg"
+    finally:
+        os.unlink(src)
+
+
+# ============================================
 # Main
 # ============================================
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: media-convert <wxgf2img|silk2mp3>", file=sys.stderr)
+        print("Usage: media-convert <wxgf2img|silk2mp3|videosample>", file=sys.stderr)
         sys.exit(1)
 
     mode = sys.argv[1]
@@ -223,6 +280,8 @@ def main():
             result, fmt = wxgf2img(data)
         elif mode == "silk2mp3":
             result, fmt = silk2mp3(data)
+        elif mode == "videosample":
+            result, fmt = videosample(data)
         else:
             print(f"Unknown mode: {mode}", file=sys.stderr)
             sys.exit(1)

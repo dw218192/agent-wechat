@@ -531,21 +531,30 @@ fn get_video_data(
         for base in &account_base_paths(account_dir) {
             let video_dir = Path::new(base).join("msg/video").join(&year_month);
 
-            // Try .mp4 first (full video)
+            // Full .mp4 cached → sample N uniformly-spaced frames into one contact-sheet image (N keyed off
+            // duration). The downstream client can't decode raw mp4; a frame grid lets a vision model see
+            // the video's content/motion. Falls through to the cover/thumbnail below if sampling fails.
             let mp4_path = video_dir.join(format!("{hash}.mp4"));
             if mp4_path.exists() {
                 if let Ok(data) = fs::read(&mp4_path) {
-                    tracing::info!("[media:video] found mp4 for local_id={}, size={}", local_id, data.len());
-                    return MediaResult {
-                        media_type: "video".into(),
-                        data: Some(base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            &data,
-                        )),
-                        url: None,
-                        format: "mp4".into(),
-                        filename: format!("msg_{local_id}.mp4"),
-                    };
+                    if let Some((sheet, fmt)) = convert_media("videosample", &data) {
+                        tracing::info!(
+                            "[media:video] sampled mp4 frames for local_id={} ({} bytes -> {} bytes)",
+                            local_id, data.len(), sheet.len());
+                        return MediaResult {
+                            media_type: "video".into(),
+                            data: Some(base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD,
+                                &sheet,
+                            )),
+                            url: None,
+                            format: fmt,
+                            filename: format!("msg_{local_id}_frames.jpg"),
+                        };
+                    }
+                    tracing::warn!(
+                        "[media:video] videosample failed for local_id={}; falling back to thumbnail",
+                        local_id);
                 }
             }
 
