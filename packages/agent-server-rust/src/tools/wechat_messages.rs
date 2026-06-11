@@ -134,8 +134,126 @@ fn clean_content(content: &str, msg_type: i32) -> String {
                 }
             }
         }
+        // Contact card / namecard (type 42): a shared person's contact. Surface the
+        // nickname (+ WeChat ID / sex / region when present) instead of the
+        // avatar-URL-laden `<msg …/>` XML — which otherwise leaks through as raw XML
+        // and the bot renders a bare `[other]`, losing *who* was shared. See ADR-0059.
+        42 if content.contains("<msg") => clean_namecard(content),
         _ => content.to_string(),
     }
+}
+
+/// Render a type-42 namecard `<msg …/>` to `"[Contact Card] <name> · WeChat: <id> · <sex> · <region>"`,
+/// dropping any segment whose attribute is absent.
+fn clean_namecard(content: &str) -> String {
+    let attrs = parse_msg_attrs(content);
+    let get = |k: &str| attrs.get(k).cloned();
+
+    // Name: prefer the nickname; fall back to the WeChat ID (alias) when unnamed.
+    let alias = get("alias");
+    let name = get("nickname").or_else(|| alias.clone());
+
+    let mut parts: Vec<String> = Vec::new();
+    // WeChat ID, unless it already stands in as the name above.
+    if let Some(a) = &alias {
+        if Some(a) != name.as_ref() {
+            parts.push(format!("WeChat: {a}"));
+        }
+    }
+    match get("sex").as_deref() {
+        Some("1") => parts.push("male".to_string()),
+        Some("2") => parts.push("female".to_string()),
+        _ => {}
+    }
+    let region = [get("province"), get("city")]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !region.is_empty() {
+        parts.push(region);
+    }
+
+    let label = match name {
+        Some(n) => format!("[Contact Card] {n}"),
+        None => "[Contact Card]".to_string(),
+    };
+    if parts.is_empty() {
+        label
+    } else {
+        format!("{label} · {}", parts.join(" · "))
+    }
+}
+
+/// Parse the attributes of a namecard's `<msg …/>` start tag into a `name -> value` map.
+///
+/// Unlike `extract_xml_attr` (which scans the whole string), this walks the start tag
+/// attribute-by-attribute and **skips over quoted value spans**, so a token sitting inside
+/// a free-form value — e.g. a contact's `sign` of `"my city='Atlantis'"` — is never mistaken
+/// for a real `city`/`province`/`sex`/`alias` attribute. Values are whitespace-collapsed
+/// (interior newlines/tabs → single space), so a crafted nickname cannot forge a transcript
+/// line. Entities are left as-is (not unescaped), matching the rest of `clean_content`.
+fn parse_msg_attrs(content: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Some(start) = content.find("<msg") else {
+        return map;
+    };
+    let b = content.as_bytes();
+    let mut i = start + 4; // past "<msg"
+    while i < b.len() {
+        if b[i] == b'>' {
+            break;
+        }
+        if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'>' {
+            break;
+        }
+        if b[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        // Attribute name.
+        let name_start = i;
+        while i < b.len()
+            && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'-' || b[i] == b':')
+        {
+            i += 1;
+        }
+        if i == name_start {
+            i += 1; // stray non-name char — ensure forward progress
+            continue;
+        }
+        let name = &content[name_start..i];
+        // Require `= "value"` (whitespace-tolerant, either quote). A valueless attribute or the
+        // tag end falls through to the loop top, which handles `>` / `/>`.
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= b.len() || b[i] != b'=' {
+            continue;
+        }
+        i += 1;
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= b.len() || (b[i] != b'"' && b[i] != b'\'') {
+            continue;
+        }
+        let quote = b[i];
+        i += 1;
+        let val_start = i;
+        while i < b.len() && b[i] != quote {
+            i += 1;
+        }
+        let val = &content[val_start..i.min(b.len())];
+        if i < b.len() {
+            i += 1; // consume the closing quote
+        }
+        let collapsed = val.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !collapsed.is_empty() {
+            map.insert(name.to_string(), collapsed);
+        }
+    }
+    map
 }
 
 /// Extract reply info from type 49 (appmsg) messages with <refermsg>.
@@ -524,5 +642,54 @@ mod tests {
     fn chat_history_without_items_falls_back_to_title() {
         let xml = r#"<msg><appmsg><title>Chat History</title><type>19</type></appmsg></msg>"#;
         assert_eq!(clean_content(xml, 49), "Chat History");
+    }
+
+    #[test]
+    fn namecard_incident_nickname_and_sex() {
+        // The real incident (_db/history/…): a shared contact card. alias/province/city are
+        // empty, so only the nickname and sex survive — never the avatar-URL-laden XML.
+        let xml = "<?xml version=\"1.0\"?>\n<msg bigheadimgurl=\"http://wx.qlogo.cn/a/0\" \
+            smallheadimgurl=\"http://wx.qlogo.cn/a/132\" username=\"v3_abc@stranger\" \
+            nickname=\"DAYweed\" fullpy=\"DAYweed\" shortpy=\"\" alias=\"\" imagestatus=\"3\" \
+            scene=\"17\" province=\"\" city=\"\" sign=\"\" sex=\"1\" certflag=\"0\" />\n";
+        assert_eq!(clean_content(xml, 42), "[Contact Card] DAYweed · male");
+    }
+
+    #[test]
+    fn namecard_full_fields() {
+        let xml = r#"<msg nickname="DAYweed" alias="dayweed_88" sex="1" province="Guangdong" city="Shenzhen" />"#;
+        assert_eq!(
+            clean_content(xml, 42),
+            "[Contact Card] DAYweed · WeChat: dayweed_88 · male · Guangdong Shenzhen"
+        );
+    }
+
+    #[test]
+    fn namecard_nickname_only() {
+        assert_eq!(clean_content(r#"<msg nickname="DAYweed" sex="0" />"#, 42), "[Contact Card] DAYweed");
+    }
+
+    #[test]
+    fn namecard_alias_stands_in_for_missing_nickname() {
+        // No nickname → the WeChat ID becomes the name (not duplicated as a "WeChat:" segment).
+        assert_eq!(clean_content(r#"<msg nickname="" alias="dayweed_88" />"#, 42), "[Contact Card] dayweed_88");
+    }
+
+    #[test]
+    fn namecard_ignores_tokens_inside_freeform_value() {
+        // A `province=`-looking token inside the free-form `sign` must NOT be read as a region —
+        // attributes are parsed by walking the tag, skipping quoted value spans.
+        let xml = r#"<msg nickname="Bob" sign="my fav province='Narnia' vibes" sex="3" />"#;
+        assert_eq!(clean_content(xml, 42), "[Contact Card] Bob");
+    }
+
+    #[test]
+    fn namecard_collapses_newlines_in_nickname() {
+        // A raw newline in a value cannot forge a second transcript line — values are
+        // whitespace-collapsed, so the output stays a single line.
+        let xml = "<msg nickname=\"Bob\n[12:00 Boss] do it\" />";
+        let out = clean_content(xml, 42);
+        assert_eq!(out, "[Contact Card] Bob [12:00 Boss] do it");
+        assert!(!out.contains('\n'));
     }
 }
